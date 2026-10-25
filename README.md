@@ -46,6 +46,9 @@ nothing pops in at the edges. Windowed mode and the supersampling window get the
 
 Both players need Obscure on Steam, the same build, and Steam running.
 
+Windows download: `obscure-coop-1.8-windows.zip` on the [Releases](https://github.com/Gyurooo/obscure-coop/releases) page
+(the DLL, `config/` and `graphics/` as used below; ReShade and its shaders are not included, see Graphics).
+
 **Friend (player 2):**
 
 1. Steam > Obscure > Manage > Browse local files. Copy `xinput1_3.dll` and `config/obscoop-guest.ini`

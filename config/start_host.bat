@@ -14,5 +14,7 @@ rem smoother edges; menu text shows smaller), 4 = 4x. Fullscreen becomes a borde
 set OBSCOOP_SSAA=2
 rem Texture filtering: 0 = the game's own, 2..16 = anisotropic (sharper surfaces at an angle).
 set OBSCOOP_ANISO=16
+rem 16:9 widescreen: 1 = fill a 16:9 screen with a wider view (default), 0 = the original 4:3 picture.
+set OBSCOOP_WIDESCREEN=1
 cd /d "%~dp0"
 start "" Obscure.exe
