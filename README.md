@@ -27,6 +27,8 @@ The host's game is the real one. The friend's game mirrors it:
 - Pickup pictures and messages.
 - **Loading a save:** when the host loads, the friend's game loads the same save by itself. At join
   the friend also gets and loads the host's save automatically.
+- Movable objects (chairs, wheeled objects such as TV stands, basketballs): the host's physics decides, the friend's game places
+  them where the host has them. Closet doors and breakable windows are not synced yet.
 - The friend's stick moves his character relative to the camera angle he sees (his game sends its camera
   direction; the host's game uses it for him), so two players in places with different camera angles each
   walk the way their own screen shows.
@@ -49,7 +51,7 @@ nothing pops in at the edges, and going back to an earlier camera view gives the
 
 Both players need Obscure on Steam, the same build, and Steam running.
 
-Windows download: `obscure-coop-1.9-windows.zip` on the [Releases](https://github.com/Gyurooo/obscure-coop/releases) page
+Windows download: `obscure-coop-1.10-windows.zip` on the [Releases](https://github.com/Gyurooo/obscure-coop/releases) page
 (the DLL, `config/` and `graphics/` as used below; ReShade and its shaders are not included, see Graphics).
 
 **Friend (player 2):**

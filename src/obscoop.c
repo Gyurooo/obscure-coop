@@ -775,6 +775,11 @@ static void handle_command(char *line, char *reply, size_t replysz)
 	} else if (!strncmp(line, "setref ", 7)) {
 		float rx, ry, rz;
 		_snprintf(reply, replysz, sscanf(line + 7, "%f %f %f", &rx, &ry, &rz) == 3 && test_set_ref(rx, ry, rz) ? "ok" : "error setref x y z");
+	} else if (!strcmp(line, "props")) {
+		props_status(reply, replysz);
+	} else if (!strncmp(line, "propset ", 8)) {
+		int tg, ix; float px, py, pz;
+		_snprintf(reply, replysz, sscanf(line + 8, "%d %d %f %f %f", &tg, &ix, &px, &py, &pz) == 5 && prop_set(tg, ix, px, py, pz) ? "ok" : "error propset tag idx x y z");
 	} else if (!strcmp(line, "camyaw")) {
 		_snprintf(reply, replysz, "yaw_mdeg %ld view_sets %ld", cam_yaw_mdeg(), cam_view_sets());
 	} else if (!strncmp(line, "shot ", 5) && strlen(line + 5) < 250) {
@@ -1019,6 +1024,8 @@ static int request_shot(const char *path);
 static long cam_yaw_mdeg(void);
 static int test_set_ref(float x, float y, float z);
 static void move_hook_install(void);
+static void props_status(char *reply, size_t replysz);
+static int prop_set(int tag, int index, float x, float y, float z);
 static long cam_view_sets(void);
 static int check_build(void)
 {

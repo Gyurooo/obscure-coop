@@ -39,6 +39,7 @@ static void guest_on_save(const char *buf, int n);
 static void host_on_save_ack(const char *buf, int n);
 static void guest_on_load(const char *buf, int n);
 static void host_on_moveref(const char *buf, int n);
+static void guest_on_props(const char *buf, int n);
 static void guest_send_moveref(void);
 
 #include "steam.c"
@@ -203,6 +204,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 			guest_on_inv(buf, n);
 		} else if (h->type == 12 /* PKT_SAVE */) {
 			guest_on_save(buf, n);
+		} else if (h->type == 20 /* PKT_PROPS */) {
+			guest_on_props(buf, n);
 		} else if (h->type == 18 /* PKT_LOAD */) {
 			guest_on_load(buf, n);
 		} else if (h->type == PKT_PONG && n == sizeof(pkt_ping)) {

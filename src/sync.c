@@ -190,6 +190,8 @@ static int list_chars(BYTE **out, int max)
 // object that joined as player 2, not the slot (0.7 playtest: the guest was switched onto the dead
 // character and crashed in FUN_0044b7e0).
 static BYTE *g_remote_rp;
+static void host_send_props(LONG tick);
+static void guest_apply_props(void);
 static float fabs_f(float v) { return v < 0 ? -v : v; }
 
 static void host_send_state(void)
@@ -2177,6 +2179,8 @@ static void __cdecl hk_SteamAPI_RunCallbacks(void)
 				host_send_ui();
 			if ((nt % 4) == 1)
 				host_send_view();
+			if ((nt % 2) == 1)
+				host_send_props(nt);
 			if ((nt % 4) == 3)
 				host_send_msgs();
 			if ((nt % 15) == 0)
@@ -2192,12 +2196,189 @@ static void __cdecl hk_SteamAPI_RunCallbacks(void)
 		guest_apply_state();
 		guest_apply_pnj();
 		guest_apply_items();
+		guest_apply_props();
 		guest_apply_inventories();
 		guest_apply_view();
 		guest_apply_msgs();
 	}
 }
 
+
+// ---- movable props (1.10) ----------------------------------------------------------------------------------
+// Chairs, wheeled objects (the TV stands: CNoeCasterObject), basketballs and mobile racks are physics entities of the
+// Noe world that move when a character hits them. They hang off CToeWorld (*(game+0x588), list at +0xc, nodes
+// {item, next}; the Toe entities of these classes point to the Noe entity at +4). A Noe entity keeps its position at
+// +0xb0 (3 floats) and its rotation at +0xbc (a quaternion); vtable slots 0x54 / 0x58 set them (and update the
+// matrix and the physics body), slot 0x30(1) freezes its velocity. Both copies build the list in the same order from
+// the level data, so a prop is identified by its class and its index among that class. The host sends the props
+// that moved (and every prop once a second); the guest applies them with the engine's own setters.
+enum { PKT_PROPS = 20 };
+enum { MAX_PROPS = 28, MAX_PROP_KEYS = 160 };
+typedef struct { BYTE tag, idx, moving, pad; float pos[3]; float rot[4]; } prop_state;
+typedef struct { pkt_hdr h; BYTE level, count; WORD pad; prop_state e[MAX_PROPS]; } pkt_props;
+static pkt_props g_rx_props;
+static volatile LONG g_rx_props_new, g_props_sent, g_props_applied, g_props_moved_here;
+typedef void(__fastcall *ent_setv_t)(void *self, void *edx, const float *v);
+
+static const struct { DWORD vt; BYTE tag; const char *name; } g_prop_cls[] = {
+	{ 0x64732c, 1, "chair" }, { 0x647318, 2, "caster" }, { 0x647354, 3, "ball" }, { 0x6472d4, 4, "rack" } };
+
+// Noe entities of the prop classes, in list order, with class tag and index within the class.
+static int list_props(BYTE **noe, BYTE *tags, BYTE *idx, int max)
+{
+	BYTE *w = rd_ptr(game_obj(), 0x588);
+	if (!w)
+		return 0;
+	BYTE *node = rd_ptr(w, 0xc);
+	BYTE cnt[8] = { 0 };
+	int n = 0, guard = 0;
+	while (node && n < max && guard++ < 2000) {
+		BYTE *item = rd_ptr(node, 0);
+		if (!item)
+			break;
+		DWORD vt = *(DWORD *)item;
+		for (int c = 0; c < 4; c++) {
+			if (vt != g_prop_cls[c].vt)
+				continue;
+			BYTE *e = rd_ptr(item, 4);
+			if (e && *(DWORD *)e >= 0x600000 && *(DWORD *)e < 0x6b0000) {
+				noe[n] = e;
+				tags[n] = g_prop_cls[c].tag;
+				idx[n] = cnt[g_prop_cls[c].tag]++;
+				n++;
+			}
+			break;
+		}
+		node = rd_ptr(node, 4);
+	}
+	return n;
+}
+
+static void host_send_props(LONG tick)
+{
+	static float last[MAX_PROP_KEYS][7];
+	static BYTE seen[MAX_PROP_KEYS];
+	BYTE *noe[MAX_PROP_KEYS], tags[MAX_PROP_KEYS], idx[MAX_PROP_KEYS];
+	int n = list_props(noe, tags, idx, MAX_PROP_KEYS);
+	static BYTE last_level = 255;
+	if ((BYTE)level_id() != last_level) {   // a new level: forget what was sent
+		memset(seen, 0, sizeof seen);
+		last_level = (BYTE)level_id();
+	}
+	pkt_props p;
+	memset(&p, 0, sizeof p);
+	p.level = (BYTE)level_id();
+	int refresh = (tick % 60) < 2, k = 0;
+	for (int i = 0; i < n; i++) {
+		float cur[7];
+		memcpy(cur, noe[i] + 0xb0, 12);
+		memcpy(cur + 3, noe[i] + 0xbc, 16);
+		int moved = !seen[i];
+		for (int j = 0; j < 3 && !moved; j++)
+			if (cur[j] - last[i][j] > 0.02f || last[i][j] - cur[j] > 0.02f) moved = 1;
+		for (int j = 3; j < 7 && !moved; j++)
+			if (cur[j] - last[i][j] > 0.0005f || last[i][j] - cur[j] > 0.0005f) moved = 1;
+		if (!moved && !refresh)
+			continue;
+		prop_state *e = &p.e[k++];
+		e->tag = tags[i]; e->idx = idx[i]; e->moving = (BYTE)moved;
+		memcpy(e->pos, cur, 12); memcpy(e->rot, cur + 3, 16);
+		memcpy(last[i], cur, sizeof cur);
+		seen[i] = 1;
+		if (k == MAX_PROPS) {
+			p.count = (BYTE)k;
+			net_send(PKT_PROPS, &p, (WORD)(4 + k * sizeof(prop_state)));
+			InterlockedIncrement(&g_props_sent);
+			k = 0;
+		}
+	}
+	if (k) {
+		p.count = (BYTE)k;
+		net_send(PKT_PROPS, &p, (WORD)(4 + k * sizeof(prop_state)));
+		InterlockedIncrement(&g_props_sent);
+	}
+}
+
+static void guest_on_props(const char *buf, int n)
+{
+	const pkt_props *p = (const pkt_props *)buf;
+	if (n < (int)(sizeof(pkt_hdr) + 4) || p->count > MAX_PROPS || n != (int)(sizeof(pkt_hdr) + 4 + p->count * sizeof(prop_state)))
+		return;
+	EnterCriticalSection(&g_state_cs);
+	if (g_rx_props_new && g_rx_props.level == p->level && g_rx_props.count + p->count <= MAX_PROPS) {
+		memcpy(&g_rx_props.e[g_rx_props.count], p->e, p->count * sizeof(prop_state));   // keep what has not been applied yet
+		g_rx_props.count = (BYTE)(g_rx_props.count + p->count);
+	} else {
+		memcpy(&g_rx_props, buf, n);
+	}
+	g_rx_props_new = 1;
+	LeaveCriticalSection(&g_state_cs);
+}
+
+static void guest_apply_props(void)
+{
+	pkt_props p;
+	if (!g_rx_props_new)
+		return;
+	EnterCriticalSection(&g_state_cs);
+	memcpy(&p, &g_rx_props, sizeof p);
+	g_rx_props_new = 0;
+	LeaveCriticalSection(&g_state_cs);
+	BYTE *g = game_obj();
+	if (!g || p.level != (BYTE)level_id() || *(DWORD *)(g + 8) == 5)
+		return;
+	BYTE *noe[MAX_PROP_KEYS], tags[MAX_PROP_KEYS], idx[MAX_PROP_KEYS];
+	int n = list_props(noe, tags, idx, MAX_PROP_KEYS);
+	for (int i = 0; i < p.count; i++) {
+		for (int j = 0; j < n; j++) {
+			if (tags[j] != p.e[i].tag || idx[j] != p.e[i].idx)
+				continue;
+			BYTE *e = noe[j];
+			void **vt = *(void ***)e;
+			int dp = 0, dr = 0;
+			for (int c = 0; c < 3; c++)
+				if (*(float *)(e + 0xb0 + 4 * c) - p.e[i].pos[c] > 0.02f || p.e[i].pos[c] - *(float *)(e + 0xb0 + 4 * c) > 0.02f) dp = 1;
+			for (int c = 0; c < 4; c++)
+				if (*(float *)(e + 0xbc + 4 * c) - p.e[i].rot[c] > 0.0005f || p.e[i].rot[c] - *(float *)(e + 0xbc + 4 * c) > 0.0005f) dr = 1;
+			if (dp)
+				((ent_setv_t)vt[0x54 / 4])(e, NULL, p.e[i].pos);
+			if (dr)
+				((ent_setv_t)vt[0x58 / 4])(e, NULL, p.e[i].rot);
+			if (dp || dr) {
+				InterlockedIncrement(&g_props_moved_here);
+				static int logged;
+				if (logged++ < 12)
+					logf("props: %s %d moved to %.0f %.0f %.0f on the host's word", g_prop_cls[p.e[i].tag - 1].name, p.e[i].idx, p.e[i].pos[0], p.e[i].pos[1], p.e[i].pos[2]);
+			}
+			break;
+		}
+	}
+	InterlockedIncrement(&g_props_applied);
+}
+
+// Test commands: "props" lists them; "propset tag idx x y z" moves one with the engine's own setter (this copy).
+static void props_status(char *reply, size_t replysz)
+{
+	BYTE *noe[MAX_PROP_KEYS], tags[MAX_PROP_KEYS], idx[MAX_PROP_KEYS];
+	int n = list_props(noe, tags, idx, MAX_PROP_KEYS);
+	int k = _snprintf(reply, replysz, "props %d sent %ld applied %ld moved_here %ld:", n, g_props_sent, g_props_applied, g_props_moved_here);
+	for (int i = 0; i < n && k > 0 && (size_t)k < replysz - 80; i++)
+		k += _snprintf(reply + k, replysz - k, " %d/%d@%.1f,%.1f,%.1f", tags[i], idx[i], *(float *)(noe[i] + 0xb0), *(float *)(noe[i] + 0xb4), *(float *)(noe[i] + 0xb8));
+}
+
+static int prop_set(int tag, int index, float x, float y, float z)
+{
+	BYTE *noe[MAX_PROP_KEYS], tags[MAX_PROP_KEYS], idx[MAX_PROP_KEYS];
+	int n = list_props(noe, tags, idx, MAX_PROP_KEYS);
+	for (int i = 0; i < n; i++) {
+		if (tags[i] == tag && idx[i] == index) {
+			float v[3] = { x, y, z };
+			((ent_setv_t)(*(void ***)noe[i])[0x54 / 4])(noe[i], NULL, v);
+			return 1;
+		}
+	}
+	return 0;
+}
 
 // Movement frame of the guest's player (1.9). FUN_0044c2b0 is the real player's per-frame update; it turns the stick
 // into a world direction relative to a forward vector, either a locked reference (real player +0xa8/+0xac/+0xb0, kept
