@@ -75,6 +75,12 @@ Files). Co-op saves go to `coop_profile\` in the same place; your own saves are 
 
 ## Graphics (optional ReShade)
 
+![Original vs improved: the courtyard and a full-resolution close-up of the fountain](docs/comparison.jpg)
+
+Left: the original game. Right: `SSAA=2`, `ANISO=16` and the ReShade preset below (same scene from the
+same save, windowed test copy at 1904x1421; about 280 fps both).
+
+
 `graphics/` holds a ReShade configuration that was tuned for this game. It is not ReShade itself:
 
 1. Get ReShade 6.8.0 from [reshade.me](https://reshade.me) (tested: `ReShade_Setup_6.8.0.exe`,
