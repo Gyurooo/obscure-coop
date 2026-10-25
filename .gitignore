@@ -1,0 +1,14 @@
+# Never commit game files: test copies of the game live here, next to the code.
+obscure-test*/
+build/
+tests/*.pid
+tests/*-before.txt
+tests/*-after.txt
+tests/*-diff.txt
+tests/*.png
+tests/shots/
+tests/chaos_*
+__pycache__/
+*.log
+*.mdmp
+*.sav
