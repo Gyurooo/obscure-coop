@@ -190,6 +190,7 @@ static int list_chars(BYTE **out, int max)
 // object that joined as player 2, not the slot (0.7 playtest: the guest was switched onto the dead
 // character and crashed in FUN_0044b7e0).
 static BYTE *g_remote_rp;
+static float fabs_f(float v) { return v < 0 ? -v : v; }
 
 static void host_send_state(void)
 {
@@ -2195,6 +2196,118 @@ static void __cdecl hk_SteamAPI_RunCallbacks(void)
 		guest_apply_view();
 		guest_apply_msgs();
 	}
+}
+
+
+// Movement frame of the guest's player (1.9). FUN_0044c2b0 is the real player's per-frame update; it turns the stick
+// into a world direction relative to a forward vector, either a locked reference (real player +0xa8/+0xac/+0xb0, kept
+// while +0xa0 is 1 and the stick direction stays close to the one it was captured with) or the level's current camera
+// (*(*(game+0x514)+0x54), axis at +0x40/+0x44/+0x48). On the host both are the host's cameras, but the guest's screen
+// shows his own camera: with two different camera angles his stick moved him in the host's frame, not the one he
+// sees (playtest report). The guest sends the camera axis of his own game (a new packet, ignored by older versions);
+// on the host the update of the guest's real player runs with that axis in place of the camera's and of the locked
+// reference, and everything is put back after the call, so player 1 is unaffected. Equal cameras give equal vectors.
+enum { PKT_MOVEREF = 19 };
+typedef struct { pkt_hdr h; DWORD flag; float ref[3]; } pkt_moveref;
+static volatile DWORD g_ref_rx_tick, g_ref_flag;
+static volatile float g_ref_vec[3];
+static volatile LONG g_ref_sent, g_ref_applied, g_ref_diff;
+static int g_test_ref_on;
+static float g_test_ref[3];
+typedef void(__fastcall *move_update_t)(void *, void *, int);
+static move_update_t g_move_tramp;
+
+static BYTE *level_camera(void)
+{
+	BYTE *g = game_obj();
+	BYTE *a = rd_ptr(g, 0x514);
+	return a ? rd_ptr(a, 0x54) : NULL;
+}
+
+static void guest_send_moveref(void)
+{
+	pkt_moveref p;
+	memset(&p, 0, sizeof p);
+	if (g_test_ref_on) {
+		p.flag = 1;
+		memcpy(p.ref, g_test_ref, 12);
+	} else {
+		BYTE *cam = level_camera();
+		if (!cam)
+			return;
+		p.flag = 1;
+		memcpy(p.ref, cam + 0x40, 12);
+	}
+	net_send(PKT_MOVEREF, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_ref_sent);
+}
+
+static void host_on_moveref(const char *buf, int n)
+{
+	const pkt_moveref *p = (const pkt_moveref *)buf;
+	if (n != (int)sizeof *p)
+		return;
+	g_ref_vec[0] = p->ref[0]; g_ref_vec[1] = p->ref[1]; g_ref_vec[2] = p->ref[2];
+	g_ref_flag = p->flag;
+	g_ref_rx_tick = GetTickCount();
+}
+
+static void __fastcall hk_move_update(void *rp, void *edx, int dt)
+{
+	BYTE *cam = (g_role == 1 && rp && rp == g_remote_rp && g_ref_flag && GetTickCount() - g_ref_rx_tick < 1500) ? level_camera() : NULL;
+	float x = g_ref_vec[0], y = g_ref_vec[1], z = g_ref_vec[2];
+	if (!cam || !(x * x + y * y > 0.0001f)) {
+		g_move_tramp(rp, edx, dt);
+		return;
+	}
+	float save_cam[3], save_ref[3];
+	memcpy(save_cam, cam + 0x40, 12);
+	memcpy(save_ref, (BYTE *)rp + 0xa8, 12);
+	if (fabs_f(save_cam[0] - x) > 0.02f || fabs_f(save_cam[1] - y) > 0.02f) {
+		if (InterlockedIncrement(&g_ref_diff) <= 20)
+			logf("movref: the guest's player 2 moves relative to (%.2f %.2f %.2f); the host's camera is (%.2f %.2f %.2f)", x, y, z, save_cam[0], save_cam[1], save_cam[2]);
+	}
+	((float *)(cam + 0x40))[0] = x; ((float *)(cam + 0x40))[1] = y; ((float *)(cam + 0x40))[2] = z;
+	((float *)((BYTE *)rp + 0xa8))[0] = x; ((float *)((BYTE *)rp + 0xa8))[1] = y; ((float *)((BYTE *)rp + 0xa8))[2] = z;
+	g_move_tramp(rp, edx, dt);
+	memcpy(cam + 0x40, save_cam, 12);
+	memcpy((BYTE *)rp + 0xa8, save_ref, 12);
+	InterlockedIncrement(&g_ref_applied);
+}
+
+static void move_hook_install(void)
+{
+	static const BYTE entry[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };   // push ebp; mov ebp, esp; mov eax, [ebp+8]
+	BYTE *f = (BYTE *)0x44c2b0;
+	if (g_move_tramp)
+		return;
+	if (memcmp(f, entry, sizeof entry)) {
+		logf("movref: FUN_0044c2b0 entry bytes not as expected; guest movement frame not corrected");
+		return;
+	}
+	BYTE *t = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!t)
+		return;
+	memcpy(t, entry, sizeof entry);
+	t[6] = 0xe9;
+	*(LONG *)(t + 7) = (LONG)(f + 6 - (t + 11));
+	g_move_tramp = (move_update_t)t;
+	DWORD old;
+	VirtualProtect(f, 6, PAGE_EXECUTE_READWRITE, &old);
+	f[0] = 0xe9;
+	*(LONG *)(f + 1) = (LONG)((BYTE *)hk_move_update - (f + 5));
+	f[5] = 0x90;
+	VirtualProtect(f, 6, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), f, 6);
+	logf("movref: guest movement frame hook installed (host)");
+}
+
+// Test command (pipe "setref x y z", or "setref off"): the guest sends this vector instead of its camera's.
+static int test_set_ref(float x, float y, float z)
+{
+	g_test_ref[0] = x; g_test_ref[1] = y; g_test_ref[2] = z;
+	g_test_ref_on = 1;
+	return 1;
 }
 
 static void sync_status(char *reply, size_t replysz)

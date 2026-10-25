@@ -772,6 +772,11 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		_snprintf(reply, replysz, "polls %ld %ld %ld %ld virtual %ld %ld %ld %ld kbd_data_reads %ld foreground_is_game %d",
 			g_polls[0], g_polls[1], g_polls[2], g_polls[3], g_virtual_reads[0], g_virtual_reads[1],
 			g_virtual_reads[2], g_virtual_reads[3], g_kbd_data_reads, fgpid == GetCurrentProcessId());
+	} else if (!strncmp(line, "setref ", 7)) {
+		float rx, ry, rz;
+		_snprintf(reply, replysz, sscanf(line + 7, "%f %f %f", &rx, &ry, &rz) == 3 && test_set_ref(rx, ry, rz) ? "ok" : "error setref x y z");
+	} else if (!strcmp(line, "camyaw")) {
+		_snprintf(reply, replysz, "yaw_mdeg %ld view_sets %ld", cam_yaw_mdeg(), cam_view_sets());
 	} else if (!strncmp(line, "shot ", 5) && strlen(line + 5) < 250) {
 		_snprintf(reply, replysz, request_shot(line + 5) ? "ok shot requested" : "no shot hook (set OBSCOOP_TESTSHOT=1)");
 	} else if (sscanf(line, "level %d %d", &user, &lx) == 2 && user >= 0 && user < 256) {
@@ -1011,6 +1016,10 @@ static DWORD WINAPI watcher(LPVOID arg)
 
 static void ws_install(void);
 static int request_shot(const char *path);
+static long cam_yaw_mdeg(void);
+static int test_set_ref(float x, float y, float z);
+static void move_hook_install(void);
+static long cam_view_sets(void);
 static int check_build(void)
 {
 	char exe[MAX_PATH];
@@ -1093,6 +1102,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		TerminateProcess(GetCurrentProcess(), 3);
 	}
 	ws_install();
+	move_hook_install();
 	char bg[8];
 	g_background = GetEnvironmentVariableA("OBSCOOP_BACKGROUND", bg, sizeof bg) && bg[0] == '1';
 	logf("background running %s", g_background ? "on" : "off");

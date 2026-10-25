@@ -38,6 +38,8 @@ static void guest_on_msg(const char *buf, int n);
 static void guest_on_save(const char *buf, int n);
 static void host_on_save_ack(const char *buf, int n);
 static void guest_on_load(const char *buf, int n);
+static void host_on_moveref(const char *buf, int n);
+static void guest_send_moveref(void);
 
 #include "steam.c"
 
@@ -139,6 +141,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		g_last_rx_tick = GetTickCount();
 		InterlockedIncrement(&g_net_rx);
 		switch (h->type) {
+		case 19 /* PKT_MOVEREF */:
+			host_on_moveref(buf, n);
+			break;
 		case PKT_HELLO: {
 			pkt_hdr w;
 			net_send(PKT_WELCOME, &w, 0);
@@ -209,7 +214,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 // Periodic work shared by both transports: timeouts, hello, the guest's input and pings.
 static void net_tick(void)
 {
-	static DWORD last_hello, last_ping, last_input, tick;
+	static DWORD last_hello, last_ping, last_input, last_moveref, tick;
 	DWORD now = GetTickCount();
 	if (g_role == 1) {
 		if (g_peer_ok && now - g_last_rx_tick > (g_use_steam ? 10000u : 3000u))
@@ -259,6 +264,10 @@ static void net_tick(void)
 		in.tick = ++tick;
 		net_send(PKT_INPUT, &in, sizeof in - sizeof(pkt_hdr));
 		last_input = now;
+	}
+	if (g_peer_ok && g_role == 2 && now - last_moveref >= 50) {
+		guest_send_moveref();
+		last_moveref = now;
 	}
 	if (g_peer_ok && now - last_ping >= 500) {
 		pkt_ping p;

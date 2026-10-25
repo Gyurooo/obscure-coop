@@ -27,6 +27,9 @@ The host's game is the real one. The friend's game mirrors it:
 - Pickup pictures and messages.
 - **Loading a save:** when the host loads, the friend's game loads the same save by itself. At join
   the friend also gets and loads the host's save automatically.
+- The friend's stick moves his character relative to the camera angle he sees (his game sends its camera
+  direction; the host's game uses it for him), so two players in places with different camera angles each
+  walk the way their own screen shows.
 - When a player dies, the pause menu opens on the host's screen after 3 s (LOAD or RESUME).
   F1 opens it at any time.
 
@@ -40,13 +43,13 @@ Optional graphics, per PC (do not need to match):
 **16:9 widescreen** (`WIDESCREEN`, on by default, affects every player who has it). In fullscreen the game
 drew a 4:3 picture with black bars on a 16:9 screen. The mod makes it fill the screen, keeps the normal vertical
 view and shows more to the left and right. The camera and the game's own culling use the wider view, so
-nothing pops in at the edges. Windowed mode and the supersampling window get the same wider view.
+nothing pops in at the edges, and going back to an earlier camera view gives the same view as before. Windowed mode and the supersampling window get the same wider view.
 
 ## Play
 
 Both players need Obscure on Steam, the same build, and Steam running.
 
-Windows download: `obscure-coop-1.8-windows.zip` on the [Releases](https://github.com/Gyurooo/obscure-coop/releases) page
+Windows download: `obscure-coop-1.9-windows.zip` on the [Releases](https://github.com/Gyurooo/obscure-coop/releases) page
 (the DLL, `config/` and `graphics/` as used below; ReShade and its shaders are not included, see Graphics).
 
 **Friend (player 2):**

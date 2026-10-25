@@ -239,6 +239,43 @@ static int request_shot(const char *path)
 	return 1;
 }
 
+// Camera yaw (1.9). The view matrix the game sets each frame gives the direction the camera looks along; its heading
+// on the ground plane (z is up) is what a player's stick direction is relative to.
+typedef HRESULT(STDMETHODCALLTYPE *dev_settransform_t)(IDirect3DDevice9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
+static dev_settransform_t real_dev_SetTransform;
+static volatile LONG g_view_yaw_mdeg = 0x7fffffff;   // milli-degrees, 0x7fffffff = none yet
+static volatile LONG g_view_sets;
+static int g_view_debug;
+double atan2(double, double);
+static HRESULT STDMETHODCALLTYPE hk_dev_SetTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE st, const D3DMATRIX *m)
+{
+	if (st == D3DTS_VIEW && m) {
+		// camera forward in world space = third column of the view matrix (row vectors, left-handed)
+		double yaw = atan2((double)m->_23, (double)m->_13) * 57.29577951308232;
+		LONG md = (LONG)(yaw * 1000.0);
+		InterlockedExchange(&g_view_yaw_mdeg, md);
+		InterlockedIncrement(&g_view_sets);
+		if (g_view_debug) {
+			static LONG last = 0x7fffffff; static int n;
+			if ((last == 0x7fffffff || md - last > 1000 || last - md > 1000) && ++n <= 300) {
+				logf("view yaw %.1f deg (forward %.2f %.2f %.2f)", yaw, m->_13, m->_23, m->_33);
+				last = md;
+			}
+		}
+	}
+	return real_dev_SetTransform(dev, st, m);
+}
+static long cam_yaw_mdeg(void) { return g_view_yaw_mdeg; }
+static long cam_view_sets(void) { return g_view_sets; }
+static void view_hook_device(IDirect3DDevice9 *dev)
+{
+	char v[8];
+	g_view_debug = GetEnvironmentVariableA("OBSCOOP_VIEW_DEBUG", v, sizeof v) && v[0] == '1';
+	if (!g_view_debug)
+		return;   // diagnostics only: logs the camera yaw and feeds the `camyaw` test command
+	patch_slot(&(*(void ***)dev)[44], (void *)hk_dev_SetTransform, (void **)&real_dev_SetTransform);
+}
+
 static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus,
 	DWORD flags, D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out)
 {
@@ -248,6 +285,8 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 			patch_slot(&(*(void ***)*out)[69], (void *)hk_dev_SetSamplerState, (void **)&real_dev_SetSamplerState);
 			logf("ssaa: off; anisotropic filtering x%d", g_aniso);
 		}
+		if (SUCCEEDED(r))
+			view_hook_device(*out);
 		{
 			char tv[8];
 			if (SUCCEEDED(r) && GetEnvironmentVariableA("OBSCOOP_TESTSHOT", tv, sizeof tv) && tv[0] == '1')
@@ -269,6 +308,7 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 		patch_slot(&vt[69], (void *)hk_dev_SetSamplerState, (void **)&real_dev_SetSamplerState);
 		logf("ssaa: anisotropic filtering x%d", g_aniso);
 	}
+	view_hook_device(*out);
 	patch_slot(&vt[16], (void *)hk_dev_Reset, (void **)&real_dev_Reset);
 	patch_slot(&vt[17], (void *)hk_dev_Present, (void **)&real_dev_Present);
 	ss_create(*out, pp);
@@ -408,7 +448,7 @@ static IDirect3D9 *WINAPI hk_Direct3DCreate9(UINT sdk)
 	IDirect3D9 *d3d = real_Direct3DCreate9(sdk);
 	ssaa_factor();
 	filters_on();
-	if (d3d && (g_ssaa != 1 || g_aniso || GetEnvironmentVariableA("OBSCOOP_TESTSHOT", (char[8]){0}, 8))) {
+	if (d3d && (g_ssaa != 1 || g_aniso || GetEnvironmentVariableA("OBSCOOP_VIEW_DEBUG", (char[8]){0}, 8) || GetEnvironmentVariableA("OBSCOOP_TESTSHOT", (char[8]){0}, 8))) {
 		patch_slot(&(*(void ***)d3d)[16], (void *)hk_d3d_CreateDevice, (void **)&real_d3d_CreateDevice);
 		logf("ssaa: Direct3DCreate9 hooked, supersampling x%d, anisotropic x%d", g_ssaa, g_aniso);
 	} else if (d3d) {
@@ -432,18 +472,40 @@ static IDirect3D9 *WINAPI hk_Direct3DCreate9(UINT sdk)
 // vertical view and widens the horizontal one to the real aspect, which also widens what the game culls.
 double atan(double);
 double tan(double);
+static int g_ws_debug;
 static void __fastcall hk_set_fov(void *cam, void *edx, float h, float v)
 {
 	(void)edx;
+	float ih = h, iv = v;
 	BYTE *rd = *(BYTE **)0x6ab890;
 	float a = (rd && *(int *)(rd + 0x18c) > 0) ? (float)*(int *)(rd + 0x188) / (float)*(int *)(rd + 0x18c) : 1.3333f;
 	if (a > 1.40f && a < 3.0f && h > 0.05f && h < 3.0f && v > 0.05f && v < 3.0f) {
+		// Camera views set their angles from the level's data: the horizontal angle is the base and the vertical one is
+		// derived from the screen aspect (ratio = a), or the pair was worked out for 4:3 (ratio 4/3). Both get the 4:3
+		// vertical view and a horizontal angle for the real aspect. A pair this hook already produced also has ratio a;
+		// the game feeds a camera's current angle back in when views change (the vertical angle is then recomputed, so
+		// only the horizontal one matches), and transforming that again made the view grow by 0.75 * a on every change
+		// (observed). So the horizontal angles produced are remembered, and a pair that matches one is passed through.
+		static float seen[64];   // horizontal angles this hook produced
+		static unsigned seen_n;
+		int ours = 0;
+		for (unsigned i = 0; i < 64 && i < seen_n; i++)
+			if (seen[i] - h < 0.0002f && h - seen[i] < 0.0002f) { ours = 1; break; }
 		double t = tan(h * 0.5), tv = tan(v * 0.5), r = t / tv;
-		if ((r > 1.28 && r < 1.38) || (r > a - 0.05 && r < a + 0.05)) {
+		int ratio_a = r > a - 0.05 && r < a + 0.05;
+		int is43 = r > 1.28 && r < 1.38;
+		if (!ours && (ratio_a || is43)) {
 			double tv43 = t * 0.75;
 			h = (float)(2.0 * atan(tv43 * a));
 			v = (float)(2.0 * atan(tv43));
+			seen[seen_n % 64] = h;
+			seen_n++;
 		}
+	}
+	if (g_ws_debug) {
+		static int n;
+		if (++n <= 400)
+			logf("fov set from %08lx: in %.4f %.4f -> out %.4f %.4f", (DWORD)__builtin_return_address(0), ih, iv, h, v);
 	}
 	*(DWORD *)((BYTE *)cam + 0x170) = 1;
 	*(float *)((BYTE *)cam + 0xc) = h;
@@ -456,6 +518,10 @@ static void ws_install(void)
 	if (GetEnvironmentVariableA("OBSCOOP_WIDESCREEN", v, sizeof v) && atoi(v) == 0) {
 		logf("widescreen: off (WIDESCREEN=0)");
 		return;
+	}
+	{
+		char dv[8];
+		g_ws_debug = GetEnvironmentVariableA("OBSCOOP_WS_DEBUG", dv, sizeof dv) && dv[0] == '1';
 	}
 	static const uint8_t expect[10] = { 0xc7, 0x86, 0x98, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
 	uint8_t *p = (uint8_t *)0x5ac1db;
