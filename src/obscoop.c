@@ -772,6 +772,8 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		_snprintf(reply, replysz, "polls %ld %ld %ld %ld virtual %ld %ld %ld %ld kbd_data_reads %ld foreground_is_game %d",
 			g_polls[0], g_polls[1], g_polls[2], g_polls[3], g_virtual_reads[0], g_virtual_reads[1],
 			g_virtual_reads[2], g_virtual_reads[3], g_kbd_data_reads, fgpid == GetCurrentProcessId());
+	} else if (!strncmp(line, "shot ", 5) && strlen(line + 5) < 250) {
+		_snprintf(reply, replysz, request_shot(line + 5) ? "ok shot requested" : "no shot hook (set OBSCOOP_TESTSHOT=1)");
 	} else if (sscanf(line, "level %d %d", &user, &lx) == 2 && user >= 0 && user < 256) {
 		g_level_cmd_entry = lx;
 		g_level_cmd_id = user;   // picked up by the next frame on the main thread
@@ -1007,6 +1009,8 @@ static DWORD WINAPI watcher(LPVOID arg)
 	return 0;
 }
 
+static void ws_install(void);
+static int request_shot(const char *path);
 static int check_build(void)
 {
 	char exe[MAX_PATH];
@@ -1060,7 +1064,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
 		static const char *keys[] = { "ROLE", "NET", "HOST_STEAMID", "REMOTE_PAD", "LOCAL_PAD", "HIDE_REAL_PADS",
-			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "SSAA", "ANISO", "TEXT_SCALE", "SMOOTH_MS" };
+			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "SSAA", "ANISO", "TEXT_SCALE", "SMOOTH_MS", "WIDESCREEN" };
 		char ini[MAX_PATH], v[64], name[64];
 		_snprintf(ini, MAX_PATH, "%s\\obscoop.ini", g_dir);
 		if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {
@@ -1088,6 +1092,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		logf("unexpected Obscure.exe build (expected Steam build 215286); exiting");
 		TerminateProcess(GetCurrentProcess(), 3);
 	}
+	ws_install();
 	char bg[8];
 	g_background = GetEnvironmentVariableA("OBSCOOP_BACKGROUND", bg, sizeof bg) && bg[0] == '1';
 	logf("background running %s", g_background ? "on" : "off");

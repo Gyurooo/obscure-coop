@@ -37,6 +37,11 @@ Optional graphics, per PC (do not need to match):
 - **16x anisotropic filtering** (`ANISO`).
 - ReShade presets (see Graphics below).
 
+**16:9 widescreen** (`WIDESCREEN`, on by default, affects every player who has it). In fullscreen the game
+drew a 4:3 picture with black bars on a 16:9 screen. The mod makes it fill the screen, keeps the normal vertical
+view and shows more to the left and right. The camera and the game's own culling use the wider view, so
+nothing pops in at the edges. Windowed mode and the supersampling window get the same wider view.
+
 ## Play
 
 Both players need Obscure on Steam, the same build, and Steam running.
@@ -70,6 +75,7 @@ variable (the host's bat uses those).
 | `SSAA` | 1 or missing = off, 2, 4 |
 | `TEXT_SCALE` | text size with SSAA; empty = same as `SSAA` |
 | `ANISO` | 0 or missing = off, 2..16 |
+| `WIDESCREEN` | 1 or missing = 16:9 fill (no side bars), 0 = the original 4:3 picture |
 | `SMOOTH_MS` | movement smoothing delay; empty = adaptive, `0` = off, a number = fixed ms |
 
 Log: `obscoop.log` next to `Obscure.exe` (`%LOCALAPPDATA%\obscoop\` when the game is under Program
@@ -135,6 +141,8 @@ Results so far are in the write-up. The suite refuses to start while any Obscure
 
 - On the friend's screen, ladders, racks and locks do not animate (the result is still mirrored).
 - Two players only (the game has two player slots).
+- At 16:9 the main menu logo and background are stretched wide. Videos and the inventory screens were not
+  checked at 16:9.
 - The lag and packet-loss test has not been run.
 
 ## License

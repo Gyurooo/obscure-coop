@@ -194,6 +194,51 @@ static HRESULT STDMETHODCALLTYPE hk_dev_Reset(IDirect3DDevice9 *dev, D3DPRESENT_
 	return hr;
 }
 
+
+// Test support (OBSCOOP_TESTSHOT=1): the "shot <path>" pipe command asks the next Present to write the back
+// buffer as raw BGRA (8-byte header: width, height) so fullscreen frames can be checked without a desktop capture.
+static char g_shot_path[260];
+static volatile LONG g_shot_pending;
+static dev_present_t real_present_shot;
+static HRESULT STDMETHODCALLTYPE hk_dev_PresentShot(IDirect3DDevice9 *dev, const RECT *src, const RECT *dst, HWND wnd, const RGNDATA *dirty)
+{
+	if (g_shot_pending) {
+		IDirect3DSurface9 *bb = NULL, *sys = NULL;
+		D3DSURFACE_DESC sd;
+		if (SUCCEEDED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && SUCCEEDED(IDirect3DSurface9_GetDesc(bb, &sd))
+			&& SUCCEEDED(IDirect3DDevice9_CreateOffscreenPlainSurface(dev, sd.Width, sd.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, NULL))
+			&& SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(dev, bb, sys))) {
+			D3DLOCKED_RECT lr;
+			if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY))) {
+				HANDLE f = CreateFileA(g_shot_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+				if (f != INVALID_HANDLE_VALUE) {
+					DWORD n, hdr[2] = { sd.Width, sd.Height };
+					WriteFile(f, hdr, 8, &n, NULL);
+					for (UINT y = 0; y < sd.Height; y++)
+						WriteFile(f, (uint8_t *)lr.pBits + (size_t)y * lr.Pitch, sd.Width * 4, &n, NULL);
+					CloseHandle(f);
+					logf("shot: wrote %ux%u to %s", sd.Width, sd.Height, g_shot_path);
+				}
+				IDirect3DSurface9_UnlockRect(sys);
+			}
+		} else {
+			logf("shot: back buffer copy failed");
+		}
+		if (sys) IDirect3DSurface9_Release(sys);
+		if (bb) IDirect3DSurface9_Release(bb);
+		g_shot_pending = 0;
+	}
+	return real_present_shot(dev, src, dst, wnd, dirty);
+}
+static int request_shot(const char *path)
+{
+	if (!real_present_shot)
+		return 0;
+	_snprintf(g_shot_path, sizeof g_shot_path, "%s", path);
+	InterlockedExchange(&g_shot_pending, 1);
+	return 1;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus,
 	DWORD flags, D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out)
 {
@@ -202,6 +247,11 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 		if (SUCCEEDED(r) && filters_on()) {
 			patch_slot(&(*(void ***)*out)[69], (void *)hk_dev_SetSamplerState, (void **)&real_dev_SetSamplerState);
 			logf("ssaa: off; anisotropic filtering x%d", g_aniso);
+		}
+		{
+			char tv[8];
+			if (SUCCEEDED(r) && GetEnvironmentVariableA("OBSCOOP_TESTSHOT", tv, sizeof tv) && tv[0] == '1')
+				patch_slot(&(*(void ***)*out)[17], (void *)hk_dev_PresentShot, (void **)&real_present_shot);
 		}
 		return r;
 	}
@@ -358,11 +408,77 @@ static IDirect3D9 *WINAPI hk_Direct3DCreate9(UINT sdk)
 	IDirect3D9 *d3d = real_Direct3DCreate9(sdk);
 	ssaa_factor();
 	filters_on();
-	if (d3d && (g_ssaa != 1 || g_aniso)) {
+	if (d3d && (g_ssaa != 1 || g_aniso || GetEnvironmentVariableA("OBSCOOP_TESTSHOT", (char[8]){0}, 8))) {
 		patch_slot(&(*(void ***)d3d)[16], (void *)hk_d3d_CreateDevice, (void **)&real_d3d_CreateDevice);
 		logf("ssaa: Direct3DCreate9 hooked, supersampling x%d, anisotropic x%d", g_ssaa, g_aniso);
 	} else if (d3d) {
 		logf("ssaa: off (SSAA=1, ANISO=0)");
 	}
 	return d3d;
+}
+
+// 16:9 widescreen (1.11). In fullscreen the game draws into a 4:3 rectangle centred on the screen (1920x1440 of
+// 2560x1440, x = 320; observed 2026-10-25) and builds its camera, HUD and menus from that rectangle. The screen
+// rectangle code (FUN_005ab420) letterboxes only when renderer +0x298 is non-zero; the renderer constructor
+// (FUN_005ac170) sets it to 1 with `mov dword [esi+0x298], 1` at 0x5ac1db. Patching that 1 to 0 gives the full
+// screen rectangle, and the camera hook below turns the fixed-width field of view into a fixed-height one. Setting WIDESCREEN: 1
+// shows more at the sides. Setting WIDESCREEN: 1 or missing = on, 0 = off. Windowed runs and SSAA's borderless
+// window already use the full client rectangle and are not affected.
+// Camera field of view (1.11). FUN_00590230 is the camera's "set field of view" (thiscall, ECX = camera, two float
+// arguments, ret 8: horizontal angle stored at +0xc, vertical at +0x10; the game's culling and projection both use
+// them). Every caller passes a pair worked out for a 4:3 screen, and the gameplay camera derives the vertical angle
+// from the horizontal one and the screen aspect (FUN_00424xxx, line "fov / (width / height)"), so at 16:9 the
+// vertical view shrinks (measured: projection _11 stays 2.4142, _22 grows from 3.219 to 4.292). This keeps the 4:3
+// vertical view and widens the horizontal one to the real aspect, which also widens what the game culls.
+double atan(double);
+double tan(double);
+static void __fastcall hk_set_fov(void *cam, void *edx, float h, float v)
+{
+	(void)edx;
+	BYTE *rd = *(BYTE **)0x6ab890;
+	float a = (rd && *(int *)(rd + 0x18c) > 0) ? (float)*(int *)(rd + 0x188) / (float)*(int *)(rd + 0x18c) : 1.3333f;
+	if (a > 1.40f && a < 3.0f && h > 0.05f && h < 3.0f && v > 0.05f && v < 3.0f) {
+		double t = tan(h * 0.5), tv = tan(v * 0.5), r = t / tv;
+		if ((r > 1.28 && r < 1.38) || (r > a - 0.05 && r < a + 0.05)) {
+			double tv43 = t * 0.75;
+			h = (float)(2.0 * atan(tv43 * a));
+			v = (float)(2.0 * atan(tv43));
+		}
+	}
+	*(DWORD *)((BYTE *)cam + 0x170) = 1;
+	*(float *)((BYTE *)cam + 0xc) = h;
+	*(float *)((BYTE *)cam + 0x10) = v;
+}
+
+static void ws_install(void)
+{
+	char v[8];
+	if (GetEnvironmentVariableA("OBSCOOP_WIDESCREEN", v, sizeof v) && atoi(v) == 0) {
+		logf("widescreen: off (WIDESCREEN=0)");
+		return;
+	}
+	static const uint8_t expect[10] = { 0xc7, 0x86, 0x98, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
+	uint8_t *p = (uint8_t *)0x5ac1db;
+	if (memcmp(p, expect, sizeof expect) != 0) {
+		logf("widescreen: expected bytes not found at 0x5ac1db, not patched");
+		return;
+	}
+	DWORD old;
+	VirtualProtect(p + 6, 4, PAGE_EXECUTE_READWRITE, &old);
+	p[6] = 0;
+	VirtualProtect(p + 6, 4, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), p, 10);
+	logf("widescreen: renderer keep-4:3 default set to 0 (full screen rectangle)");
+	static const uint8_t fov_expect[10] = { 0xd9, 0x44, 0x24, 0x04, 0xc7, 0x81, 0x70, 0x01, 0x00, 0x00 };
+	uint8_t *f = (uint8_t *)0x590230;
+	if (memcmp(f, fov_expect, sizeof fov_expect) != 0) {
+		logf("widescreen: camera field-of-view function not as expected, view not widened");
+		return;
+	}
+	VirtualProtect(f, 5, PAGE_EXECUTE_READWRITE, &old);
+	f[0] = 0xe9;
+	*(LONG *)(f + 1) = (LONG)((uint8_t *)hk_set_fov - (f + 5));
+	VirtualProtect(f, 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), f, 5);
+	logf("widescreen: camera field of view hooked (Hor+, 4:3 vertical view kept)");
 }
