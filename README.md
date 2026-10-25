@@ -1,3 +1,5 @@
+![obscure-coop: online co-op for Obscure (2004), two players, over Steam](docs/banner.png)
+
 # obscure-coop
 
 Online co-op for **Obscure** (Hydravision, 2004) over Steam: two players on two PCs play the story
