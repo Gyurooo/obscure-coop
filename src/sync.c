@@ -42,8 +42,9 @@ typedef struct { pkt_hdr h; DWORD seq, entry; char name[32]; } pkt_level;
 typedef struct { DWORD vtable; float pos[3], dir[3], hp; BYTE dead58, dead5c; } pnj_state;
 typedef struct { pkt_hdr h; DWORD frame, t_ms; BYTE level, count; pnj_state e[MAX_PNJ]; } pkt_pnj;   // t_ms as in pkt_state
 #define PNJ_HDR (2 * sizeof(DWORD) + 2)
+static volatile LONG g_breaks_applied;
 #define MAX_ITEMS 48
-typedef struct { DWORD type, id, vtable; BYTE kind; DWORD a, b; } item_state;   // kind 1 door (a +0x88, b +0xfc), 2 collected
+typedef struct { DWORD type, id, vtable; BYTE kind; DWORD a, b; } item_state;   // kind 1 door (a +0x88, b +0xfc), 2 collected, 3 broken (b = +0x30)
 typedef struct { pkt_hdr h; DWORD frame; BYTE level, count; item_state e[MAX_ITEMS]; } pkt_items;
 #define SAVE_CHUNK 1000
 typedef struct { pkt_hdr h; DWORD xfer, total, offset; WORD len; BYTE data[SAVE_CHUNK]; } pkt_save;
@@ -192,6 +193,8 @@ static int list_chars(BYTE **out, int max)
 static BYTE *g_remote_rp;
 static void host_send_props(LONG tick);
 static void guest_apply_props(void);
+static void host_send_breaks(LONG tick);
+static void guest_apply_breaks(void);
 static float fabs_f(float v) { return v < 0 ? -v : v; }
 
 static void host_send_state(void)
@@ -365,6 +368,17 @@ static int is_collectable(BYTE *it)
 	return ((item_query_t)(*(void ***)it)[2])(it, NULL) != 0;
 }
 
+// Breakable items (windows, door windows, walls): CItBreakable (vtable 0x64dc14), CItBreakableDoorWindow (0x64dcf4),
+// CItBreakableWall (0x64dde4), CItBreakableWall2 (0x64de54), CItBreakableWindow (0x64e02c). Item +0x2c is 1 once broken
+// and +0x30 counts the break animation up to 1000; vtable slot 0x60 breaks it with sound and effects (what
+// TM_EventBreakIt calls), slot 0x64 breaks it at once without them. The pieces that fly are not synced.
+typedef void(__fastcall *item_void_t)(void *self, void *edx);
+static int is_breakable(BYTE *it)
+{
+	DWORD vt = *(DWORD *)it;
+	return vt == 0x64dc14 || vt == 0x64dcf4 || vt == 0x64dde4 || vt == 0x64de54 || vt == 0x64e02c;
+}
+
 static void host_send_items(void)
 {
 	BYTE *it[256];
@@ -382,6 +396,10 @@ static void host_send_items(void)
 		} else if (is_collectable(it[i]) && *(DWORD *)(it[i] + 0xfc)) {
 			e->kind = 2;
 			e->a = e->b = 1;
+		} else if (is_breakable(it[i]) && *(DWORD *)(it[i] + 0x2c)) {
+			e->kind = 3;
+			e->a = 1;
+			e->b = *(DWORD *)(it[i] + 0x30);
 		} else {
 			continue;
 		}
@@ -398,6 +416,35 @@ static void host_send_items(void)
 		p.count = (BYTE)k;
 		net_send(PKT_ITEMS, &p, (WORD)(sizeof(DWORD) + 2 + k * sizeof(item_state)));
 	}
+}
+
+
+// Test commands: "brk" lists the breakable items (type/id, vtable, broken flag, animation); "breakit type id [instant]"
+// breaks one of this copy's the way TM_EventBreakIt does.
+static void brk_status(char *reply, size_t replysz)
+{
+	BYTE *it[256];
+	int n = list_entities(0x30, it, 256), k = _snprintf(reply, replysz, "breakables applied %ld:", g_breaks_applied), cnt = 0;
+	for (int i = 0; i < n && k > 0 && (size_t)k < replysz - 60; i++) {
+		if (!is_breakable(it[i]))
+			continue;
+		k += _snprintf(reply + k, replysz - k, " %lu/%lu v%lx b%lu t%lu", *(DWORD *)(it[i] + 4), *(DWORD *)(it[i] + 8), *(DWORD *)it[i], *(DWORD *)(it[i] + 0x2c), *(DWORD *)(it[i] + 0x30));
+		cnt++;
+	}
+	_snprintf(reply + k, replysz - k, " (%d)", cnt);
+}
+
+static int brk_do(DWORD type, DWORD id, int instant)
+{
+	BYTE *it[256];
+	int n = list_entities(0x30, it, 256);
+	for (int i = 0; i < n; i++) {
+		if (is_breakable(it[i]) && *(DWORD *)(it[i] + 4) == type && *(DWORD *)(it[i] + 8) == id) {
+			((item_void_t)(*(void ***)it[i])[instant ? 0x64 / 4 : 0x60 / 4])(it[i], NULL);
+			return 1;
+		}
+	}
+	return 0;
 }
 
 static void guest_on_items(const char *buf, int n)
@@ -435,6 +482,11 @@ static void guest_apply_items(void)
 					*(DWORD *)(it[j] + 0xfc) = p.e[i].b;
 					InterlockedIncrement(&g_doors_set);
 				}
+			} else if (p.e[i].kind == 3 && !*(DWORD *)(it[j] + 0x2c)) {
+				// animated break (sound, effects) while the host's one is still going, at once if it finished long ago
+				((item_void_t)(*(void ***)it[j])[p.e[i].b >= 1000 ? 0x64 / 4 : 0x60 / 4])(it[j], NULL);
+				InterlockedIncrement(&g_breaks_applied);
+				logf("sync: breakable type %lu id %lu was broken on the host; broken here (%s)", p.e[i].type, p.e[i].id, p.e[i].b >= 1000 ? "at once" : "animated");
 			} else if (p.e[i].kind == 2 && !*(DWORD *)(it[j] + 0xfc)) {
 				*(DWORD *)(it[j] + 0xfc) = 1;
 				((item_set_t)(*(void ***)it[j])[35])(it[j], NULL, 0);
@@ -2181,6 +2233,8 @@ static void __cdecl hk_SteamAPI_RunCallbacks(void)
 				host_send_view();
 			if ((nt % 2) == 1)
 				host_send_props(nt);
+			if ((nt % 6) == 4)
+				host_send_breaks(nt);
 			if ((nt % 4) == 3)
 				host_send_msgs();
 			if ((nt % 15) == 0)
@@ -2197,6 +2251,7 @@ static void __cdecl hk_SteamAPI_RunCallbacks(void)
 		guest_apply_pnj();
 		guest_apply_items();
 		guest_apply_props();
+		guest_apply_breaks();
 		guest_apply_inventories();
 		guest_apply_view();
 		guest_apply_msgs();
@@ -2378,6 +2433,117 @@ static int prop_set(int tag, int index, float x, float y, float z)
 		}
 	}
 	return 0;
+}
+
+// ---- breakable scene objects: windows in walls, vending machines (1.11) ---------------------------------------
+// A CNoeBreakableUnbroken (vtable 0x653114; CToeWorld's list nodes point to it at +4) holds its CNoeBreakableGroup at +0x2f4 (the
+// group's own vtable is 0x65307c). The group keeps a broken flag at +0x7c; FUN_0052a820 (this = group) sets it and
+// switches the group's members from the whole object to the broken one with its effects. The game's own entity
+// serializer (slots 3 and 4 of the unbroken entity) sends the same flag. Vending machines are the same class and
+// their drink is an ordinary item, which the item sync already carries. Both copies build the list in the same
+// order, so an entity is identified by its index among these. Only the break is synced, not the flying pieces.
+enum { PKT_BREAKS = 21 };
+enum { MAX_BREAKS = 96 };
+typedef struct { pkt_hdr h; BYTE level, count; WORD pad; BYTE idx[MAX_BREAKS]; } pkt_breaks;
+static pkt_breaks g_rx_breaks;
+static volatile LONG g_rx_breaks_new, g_breaks_sent, g_scene_breaks_applied;
+typedef void(__fastcall *grp_break_t)(void *group, void *edx);
+
+static int list_breakables(BYTE **grp, int max)
+{
+	BYTE *w = rd_ptr(game_obj(), 0x588);
+	if (!w)
+		return 0;
+	BYTE *node = rd_ptr(w, 0xc);
+	int n = 0, guard = 0;
+	while (node && n < max && guard++ < 4000) {
+		BYTE *item = rd_ptr(node, 0);
+		if (!item)
+			break;
+		BYTE *e = rd_ptr(item, 4);   // the Toe wrapper points to the Noe entity
+		if (e && *(DWORD *)e == 0x653114) {
+			BYTE *g = rd_ptr(e, 0x2f4);
+			grp[n++] = (g && *(DWORD *)g == 0x65307c) ? g : NULL;
+		}
+		node = rd_ptr(node, 4);
+	}
+	return n;
+}
+
+static void host_send_breaks(LONG tick)
+{
+	static BYTE last[MAX_BREAKS], last_n, last_level = 255;
+	BYTE *grp[MAX_BREAKS];
+	int n = list_breakables(grp, MAX_BREAKS);
+	pkt_breaks p;
+	memset(&p, 0, sizeof p);
+	p.level = (BYTE)level_id();
+	for (int i = 0; i < n; i++)
+		if (grp[i] && *(DWORD *)(grp[i] + 0x7c))
+			p.idx[p.count++] = (BYTE)i;
+	int same = last_level == p.level && last_n == p.count && !memcmp(last, p.idx, p.count);
+	if (same && (tick % 120) != 0)
+		return;
+	last_level = p.level;
+	last_n = p.count;
+	memcpy(last, p.idx, sizeof last);
+	if (!p.count && same)
+		return;
+	net_send(PKT_BREAKS, &p, (WORD)(4 + p.count));
+	InterlockedIncrement(&g_breaks_sent);
+}
+
+static void guest_on_breaks(const char *buf, int n)
+{
+	const pkt_breaks *p = (const pkt_breaks *)buf;
+	if (n < (int)(sizeof(pkt_hdr) + 4) || p->count > MAX_BREAKS || n != (int)(sizeof(pkt_hdr) + 4 + p->count))
+		return;
+	EnterCriticalSection(&g_state_cs);
+	memcpy(&g_rx_breaks, buf, n);
+	g_rx_breaks_new = 1;
+	LeaveCriticalSection(&g_state_cs);
+}
+
+static void guest_apply_breaks(void)
+{
+	pkt_breaks p;
+	if (!g_rx_breaks_new)
+		return;
+	EnterCriticalSection(&g_state_cs);
+	memcpy(&p, &g_rx_breaks, sizeof p);
+	g_rx_breaks_new = 0;
+	LeaveCriticalSection(&g_state_cs);
+	BYTE *g = game_obj();
+	if (!g || p.level != (BYTE)level_id() || *(DWORD *)(g + 8) == 5)
+		return;
+	BYTE *grp[MAX_BREAKS];
+	int n = list_breakables(grp, MAX_BREAKS);
+	for (int i = 0; i < p.count; i++) {
+		if (p.idx[i] < n && grp[p.idx[i]] && !*(DWORD *)(grp[p.idx[i]] + 0x7c)) {
+			((grp_break_t)0x52a820)(grp[p.idx[i]], NULL);
+			InterlockedIncrement(&g_scene_breaks_applied);
+			logf("sync: breakable object %d was broken on the host; broken here", p.idx[i]);
+		}
+	}
+}
+
+// Test commands: "sbrk" lists them (index, broken flag); "sbreakit index" breaks one on this copy.
+static void sbrk_status(char *reply, size_t replysz)
+{
+	BYTE *grp[MAX_BREAKS];
+	int n = list_breakables(grp, MAX_BREAKS), k = _snprintf(reply, replysz, "scene breakables %d sent %ld applied %ld:", n, g_breaks_sent, g_scene_breaks_applied);
+	for (int i = 0; i < n && k > 0 && (size_t)k < replysz - 20; i++)
+		k += _snprintf(reply + k, replysz - k, " %d=%d", i, grp[i] ? (int)*(DWORD *)(grp[i] + 0x7c) : -1);
+}
+
+static int sbrk_do(int index)
+{
+	BYTE *grp[MAX_BREAKS];
+	int n = list_breakables(grp, MAX_BREAKS);
+	if (index < 0 || index >= n || !grp[index])
+		return 0;
+	((grp_break_t)0x52a820)(grp[index], NULL);
+	return 1;
 }
 
 // Movement frame of the guest's player (1.9). FUN_0044c2b0 is the real player's per-frame update; it turns the stick

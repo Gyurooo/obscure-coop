@@ -775,6 +775,16 @@ static void handle_command(char *line, char *reply, size_t replysz)
 	} else if (!strncmp(line, "setref ", 7)) {
 		float rx, ry, rz;
 		_snprintf(reply, replysz, sscanf(line + 7, "%f %f %f", &rx, &ry, &rz) == 3 && test_set_ref(rx, ry, rz) ? "ok" : "error setref x y z");
+	} else if (!strcmp(line, "sbrk")) {
+		sbrk_status(reply, replysz);
+	} else if (!strncmp(line, "sbreakit ", 9)) {
+		_snprintf(reply, replysz, sbrk_do(atoi(line + 9)) ? "ok" : "error sbreakit index");
+	} else if (!strcmp(line, "brk")) {
+		brk_status(reply, replysz);
+	} else if (!strncmp(line, "breakit ", 8)) {
+		unsigned bt, bi; int inst = 0;
+		int nn = sscanf(line + 8, "%u %u %d", &bt, &bi, &inst);
+		_snprintf(reply, replysz, nn >= 2 && brk_do(bt, bi, inst) ? "ok" : "error breakit type id [instant]");
 	} else if (!strcmp(line, "props")) {
 		props_status(reply, replysz);
 	} else if (!strncmp(line, "propset ", 8)) {
@@ -1025,6 +1035,10 @@ static long cam_yaw_mdeg(void);
 static int test_set_ref(float x, float y, float z);
 static void move_hook_install(void);
 static void props_status(char *reply, size_t replysz);
+static void brk_status(char *reply, size_t replysz);
+static void sbrk_status(char *reply, size_t replysz);
+static int sbrk_do(int index);
+static int brk_do(DWORD type, DWORD id, int instant);
 static int prop_set(int tag, int index, float x, float y, float z);
 static long cam_view_sets(void);
 static int check_build(void)
